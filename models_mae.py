@@ -14,7 +14,7 @@ from functools import partial
 import torch
 import torch.nn as nn
 
-from timm.models.vision_transformer import PatchEmbed, Block
+from timm.models.vision_transformer import PatchEmbed, Block, VisionTransformer
 
 from util.pos_embed import get_2d_sincos_pos_embed
 
@@ -219,6 +219,73 @@ class MaskedAutoencoderViT(nn.Module):
         loss = self.forward_loss(imgs, pred, mask)
         return loss, pred, mask
 
+
+class MaskedAutoencoderDeiT(MaskedAutoencoderViT):
+    '''Another MAE with DeiT backbone'''
+    def __init__(self, img_size=32, patch_size=4, in_chans=3, 
+                 embed_dim=192, depth=24, num_heads=16, decoder_embed_dim=512, 
+                 decoder_depth=8, decoder_num_heads=16, mlp_ratio=4, norm_layer=nn.LayerNorm, norm_pix_loss=False):
+        # --------------------------------------------------------------------------
+        # MAE encoder specifics
+        self.patch_embed = PatchEmbed(img_size, patch_size, in_chans, embed_dim)
+        num_patches = self.patch_embed.num_patches
+
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, embed_dim), requires_grad=False)  # fixed sin-cos embedding
+
+        self.encoder = deit_tiny_patch4_32()
+        self.norm = norm_layer(embed_dim)
+        # --------------------------------------------------------------------------
+
+        # --------------------------------------------------------------------------
+        # MAE decoder specifics
+        self.decoder_embed = nn.Linear(embed_dim, decoder_embed_dim, bias=True)
+
+        self.mask_token = nn.Parameter(torch.zeros(1, 1, decoder_embed_dim))
+
+        self.decoder_pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, decoder_embed_dim), requires_grad=False)  # fixed sin-cos embedding
+
+        self.decoder_blocks = nn.ModuleList([
+            Block(decoder_embed_dim, decoder_num_heads, mlp_ratio, qkv_bias=True, qk_scale=None, norm_layer=norm_layer)
+            for i in range(decoder_depth)])
+
+        self.decoder_norm = norm_layer(decoder_embed_dim)
+        self.decoder_pred = nn.Linear(decoder_embed_dim, patch_size**2 * in_chans, bias=True) # decoder to patch
+        # --------------------------------------------------------------------------
+
+        self.norm_pix_loss = norm_pix_loss
+
+        self.initialize_weights()
+
+    def forward_encoder(self, x, mask_ratio):
+        # embed patches
+        x = self.patch_embed(x)
+
+        # add pos embed w/o cls token
+        x = x + self.pos_embed[:, 1:, :]
+
+        # masking: length -> length * mask_ratio
+        x, mask, ids_restore = self.random_masking(x, mask_ratio)
+
+        # append cls token
+        cls_token = self.cls_token + self.pos_embed[:, :1, :]
+        cls_tokens = cls_token.expand(x.shape[0], -1, -1)
+        x = torch.cat((cls_tokens, x), dim=1)
+
+        # apply Transformer
+        x = self.encoder(x)
+        x = self.norm(x)
+
+        return x, mask, ids_restore
+
+
+def deit_tiny_patch4_32(pretrained=False, **kwargs):
+    '''DeiT tiny model. Patch size 4. Image size 32x32'''
+    model = VisionTransformer(
+        patch_size=4, embed_dim=192, depth=12, num_heads=3, mlp_ratio=4, qkv_bias=True,
+        norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
+    # model.default_cfg = _cfg()
+    return model
 
 def mae_vit_base_patch16_dec512d8b(**kwargs):
     model = MaskedAutoencoderViT(
